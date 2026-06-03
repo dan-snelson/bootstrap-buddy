@@ -268,43 +268,93 @@ class BBMechanism: NSObject {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         guard let output: String = String(data: data, encoding: String.Encoding.utf8)
         else { return false }
-        // Check if the username is in the output:
         os_log("dscl output: %{public}@", log: BBMechanism.log, type: .debug, output)
-        os_log("Admin Status: %{public}@", log: BBMechanism.log, type: .debug, output.contains(username).description)
-        return output.contains(username)
+
+        // Exact token match prevents substring false positives (e.g., "alex" matching "alexander").
+        let members = output
+            .replacingOccurrences(of: "GroupMembership:", with: "")
+            .split(whereSeparator: { $0.isWhitespace })
+            .map(String.init)
+        let isAdmin = members.contains(username)
+
+        os_log("Admin group members: %{public}@", log: BBMechanism.log, type: .debug, members.joined(separator: ","))
+        os_log("Admin Status: %{public}@", log: BBMechanism.log, type: .debug, isAdmin.description)
+        return isAdmin
+    }
+
+    private enum AdminGroupMutationError: LocalizedError {
+        case launchFailed(operation: String, details: String)
+        case commandFailed(operation: String, exitCode: Int32, stderr: String)
+
+        var errorDescription: String? {
+            switch self {
+            case .launchFailed(let operation, let details):
+                return "Unable to start dscl for \(operation): \(details)"
+            case .commandFailed(let operation, let exitCode, let stderr):
+                if stderr.isEmpty {
+                    return "dscl \(operation) failed with exit code \(exitCode)."
+                }
+                return "dscl \(operation) failed with exit code \(exitCode): \(stderr)"
+            }
+        }
+    }
+
+    private func mutateAdminGroup(username: String, operation: String, arguments: [String]) throws {
+        let task = Process()
+        task.launchPath = "/usr/bin/dscl"
+        task.arguments = arguments
+
+        let errorPipe = Pipe()
+        task.standardError = errorPipe
+
+        do {
+            try task.run()
+        } catch {
+            os_log(
+                "Failed to launch dscl for user \"%{public}@\" during %{public}@: %{public}@",
+                log: BBMechanism.log, type: .error, username, operation, error.localizedDescription)
+            throw AdminGroupMutationError.launchFailed(
+                operation: operation, details: error.localizedDescription)
+        }
+
+        task.waitUntilExit()
+
+        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        errorPipe.fileHandleForReading.closeFile()
+        let errorMessage =
+            String(data: errorData, encoding: String.Encoding.utf8)?
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines) ?? ""
+
+        if task.terminationStatus != 0 {
+            os_log(
+                "dscl %{public}@ failed for user \"%{public}@\" with non-zero exit status: %{public}@",
+                log: BBMechanism.log, type: .error, operation, username,
+                String(task.terminationStatus))
+            if !errorMessage.isEmpty {
+                os_log(
+                    "dscl %{public}@ stderr: %{public}@", log: BBMechanism.log,
+                    type: .error, operation, errorMessage)
+            }
+            throw AdminGroupMutationError.commandFailed(
+                operation: operation, exitCode: task.terminationStatus, stderr: errorMessage)
+        }
     }
 
     // Elevate user to admin
     func elevateUser(username: String) throws {
         os_log("Temporarily adding user \"%{public}@\" to admin group…", log: BBMechanism.log, type: .default, username)
-        let task = Process()
-        task.launchPath = "/usr/bin/dscl"
-        task.arguments = [".", "append", "/Groups/admin", "GroupMembership", username]
-        task.launch()
-        task.waitUntilExit()
-        if task.terminationStatus != 0 {
-            let termstatus = String(describing: task.terminationStatus)
-            os_log(
-                "User elevation failed with a non-zero exit status: %{public}@",
-                log: BBMechanism.log, type: .error, termstatus)
-        }
+        try mutateAdminGroup(
+            username: username, operation: "elevation",
+            arguments: [".", "append", "/Groups/admin", "GroupMembership", username])
         os_log("User \"%{public}@\" elevated to admin.", log: BBMechanism.log, type: .default, username)
     }
 
     // Demote user to standard
     func demoteUser(username: String) throws {
         os_log("Removing user \"%{public}@\" from admin group…", log: BBMechanism.log, type: .default, username)
-        let task = Process()
-        task.launchPath = "/usr/bin/dscl"
-        task.arguments = [".", "delete", "/Groups/admin", "GroupMembership", username]
-        task.launch()
-        task.waitUntilExit()
-        if task.terminationStatus != 0 {
-            let termstatus = String(describing: task.terminationStatus)
-            os_log(
-                "User demotion failed with a non-zero exit status: %{public}@",
-                log: BBMechanism.log, type: .error, termstatus)
-        }
+        try mutateAdminGroup(
+            username: username, operation: "demotion",
+            arguments: [".", "delete", "/Groups/admin", "GroupMembership", username])
         os_log("User \"%{public}@\" demoted to standard.", log: BBMechanism.log, type: .default, username)
     }
 }
